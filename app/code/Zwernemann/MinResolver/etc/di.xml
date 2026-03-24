@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!--
+    Global scope: covers both adminhtml and frontend areas.
+    The fix is harmless on the frontend and critical for admin AJAX navigation.
+-->
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+
+    <!--
+        Fix intermittent globals.js / *.min.js 404 errors caused by:
+          1. Stale baseUrl captured in closure of the original min-resolver
+          2. Double-wrapping of nameToUrl on repeated AJAX navigation in the Admin
+
+        See Zwernemann\MinResolver\Plugin\Framework\RequireJs\MinResolverPlugin for details.
+    -->
+    <type name="Magento\Framework\RequireJs\Config">
+        <plugin name="zwernemann_minresolver_fix"
+                type="Zwernemann\MinResolver\Plugin\Framework\RequireJs\MinResolverPlugin"
+                sortOrder="10"/>
+    </type>
+
+</config>
