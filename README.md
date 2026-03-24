@@ -171,3 +171,14 @@ bin/magento cache:flush
 ## License
 
 MIT
+
+
+## Contact
+
+**Zwernemann Medienentwicklung**\
+Martin Zwernemann\
+79730 Murg, Germany
+
+[To the website](https://www.zwernemann.de/)
+
+If you have questions, problems, or ideas for new features – feel free to get in touch.
