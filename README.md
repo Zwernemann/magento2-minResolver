@@ -1,4 +1,4 @@
-# Zwernemann_MinResolver
+# MinResolver
 
 Fixes intermittent `*.min.js` 404 errors in Magento 2 caused by two defects in the generated `requirejs-min-resolver.js`.
 
