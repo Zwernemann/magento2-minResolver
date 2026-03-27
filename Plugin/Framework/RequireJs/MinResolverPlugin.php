@@ -9,7 +9,7 @@ namespace Zwernemann\MinResolver\Plugin\Framework\RequireJs;
 use Magento\Framework\RequireJs\Config;
 
 /**
- * Appends a robust safety wrapper to the requirejs-min-resolver.js output.
+ * Replaces/extends the requirejs-min-resolver.js output with a robust v5 patch.
  *
  * Problem
  * -------
@@ -19,19 +19,23 @@ use Magento\Framework\RequireJs\Config;
  *   url.indexOf(baseUrl) === 0
  * fails → modules load without the .min suffix → 404 errors (e.g. mage/adminhtml/globals.js).
  *
- * Additionally, in the Magento Admin panel, AJAX-based page navigation can cause the script
- * to be re-injected and re-evaluated multiple times. Each evaluation wraps nameToUrl again
- * ("double-wrapping"), leading to incorrect URL resolution or infinite recursion in the
- * closure chain.
+ * Additionally, after order creation RequireJS creates a '$' context that does not have
+ * the resolver applied, so modules loaded via that context load as .js instead of .min.js.
  *
- * Fix
- * ---
- * This plugin appends a second IIFE after the original resolver that:
- *   1. Uses an idempotency guard (__mRF flag) so re-execution has no effect.
- *   2. Reads ctx.config.baseUrl dynamically at call time (not captured in closure).
- *   3. Hooks require.s.newContext so future RequireJS contexts also get the resolver,
- *      except the '$' unbundled context used by mage/requirejs/mixins.js (which must
- *      return non-min paths for mixin lookups).
+ * v4 regression (fixed in v5)
+ * ---------------------------
+ * v4's require.load hook recomputed the URL via c.nameToUrl(m).  When path-mappings were
+ * not yet applied to the context (timing during requirejs-config.min.js processing), nameToUrl
+ * returned the bare module name (e.g. "prototype" → "prototype.min.js") instead of the mapped
+ * path ("prototype/prototype.min.js") → extra 404s.
+ *
+ * v5 Fix
+ * ------
+ * Three complementary patches:
+ *   1. nameToUrl patch for context '_' — reads baseUrl dynamically (fixes stale capture).
+ *   2. patchCtx + newContext hook — applies the same fix to ALL present and future contexts.
+ *   3. require.load hook — only converts the *existing* URL 'u' (.js → .min.js), never
+ *      recomputes via nameToUrl.  This eliminates the v4 regression.
  *
  * Confirmed related Magento issues
  * ---------------------------------
@@ -39,11 +43,6 @@ use Magento\Framework\RequireJs\Config;
  * - #38117  https://github.com/magento/magento2/issues/38117
  * - #28116  https://github.com/magento/magento2/issues/28116
  * - #4961   https://github.com/magento/magento2/issues/4961
- *
- * Scope
- * -----
- * Registered in global di.xml (covers both adminhtml and frontend areas).
- * The fix is harmless on the frontend; it is critical for admin AJAX navigation.
  */
 class MinResolverPlugin
 {
@@ -58,29 +57,35 @@ class MinResolverPlugin
             return $result;
         }
 
-        // Appended after the original resolver. Two IIFEs in sequence is valid JS.
-        // Uses __mRF flag to be idempotent (safe if script is re-executed on AJAX nav).
-        $extra = '(function(){' .
-            'var a=function(c){' .
-                'if(c.__mRF)return;' .
-                'c.__mRF=true;' .
-                'var p=c.nameToUrl;' .
-                'c.nameToUrl=function(){' .
-                    'var u=p.apply(c,arguments),b=c.config.baseUrl;' .
-                    'if(u.indexOf(b)===0&&!/\\.min\\.js$/.test(u)){' .
-                        'u=u.replace(/\\.js$/,\'.min.js\');' .
-                    '}' .
-                    'return u;' .
-                '};' .
-            '};' .
-            'a(require.s.contexts._);' .
-            'var n=require.s.newContext;' .
-            'require.s.newContext=function(x){' .
-                'var c=n.apply(this,arguments);' .
-                'if(x!==\'$\'){a(c);}' .
-                'return c;' .
-            '};' .
-        '})();';
+        // v5: three IIFEs appended after the original resolver.
+        // 1) nameToUrl patch for context _ with dynamic baseUrl
+        // 2) patchCtx + newContext hook for all contexts
+        // 3) require.load safety net (no nameToUrl recomputation - key v5 fix)
+        $extra = <<<'JS'
+(function(){
+var ctx=require.s.contexts._,origNameToUrl=ctx.nameToUrl;
+ctx.nameToUrl=function(){
+var url=origNameToUrl.apply(ctx,arguments),b=ctx.config&&ctx.config.baseUrl;
+if(b&&url.indexOf(b)===0&&!url.match(/\/hugerte\//)&&!url.match(/\/v1\/songbird/)){
+url=url.replace(/(\.min)?\.js$/,'.min.js');}
+return url;};
+}());
+(function(){
+function patchCtx(c){if(!c||c.__mRF)return;c.__mRF=true;var p=c.nameToUrl;
+c.nameToUrl=function(){var u=p.apply(c,arguments),b=c.config&&c.config.baseUrl;
+if(b&&u.indexOf(b)===0&&!/\.min\.js$/.test(u)){u=u.replace(/\.js$/,'.min.js');}return u;};}
+var ctxs=require.s.contexts;
+for(var n in ctxs){if(Object.prototype.hasOwnProperty.call(ctxs,n))patchCtx(ctxs[n]);}
+if(!require.s.__mNCF){require.s.__mNCF=true;var oNC=require.s.newContext;
+require.s.newContext=function(){var c=oNC.apply(this,arguments);patchCtx(c);return c;};}
+if(!require.__mRL){require.__mRL=true;var ol=require.load;
+require.load=function(c,m,u){var b=c&&c.config&&c.config.baseUrl;
+if(b&&u&&u.indexOf(b)===0&&/\.js$/.test(u)&&!/\.min\.js$/.test(u)
+&&!/\/hugerte\//.test(u)&&!/\/v1\/songbird/.test(u)){u=u.replace(/\.js$/,'.min.js');}
+return ol.call(this,c,m,u);};}
+console.info('[rjsFix] v5 active');
+}());
+JS;
 
         return $result . "\n" . $extra;
     }
