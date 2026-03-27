@@ -16,8 +16,6 @@ and injects it into every Admin page to ensure RequireJS loads `.min.js` URLs.
 If that resolver has a gap (see Root Cause below), a module gets requested as
 plain `.js`, which returns a 404.
 
-### The Problem
-
 ```
 GET /static/.../mage/adminhtml/globals.js net::ERR_ABORTED 404 (Not Found)
 ```
