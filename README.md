@@ -173,8 +173,6 @@ unminified JS and must not be rewritten.
 ## Compatibility
 
 - Magento 2.4.x (tested on 2.4.7-p9)
-- Theme-independent — works with any Admin theme
-- No PHP, no `setup:di:compile`, no Composer dependency
 - Only active when **Minify JavaScript Files** is enabled; has no effect otherwise
 
 ---
