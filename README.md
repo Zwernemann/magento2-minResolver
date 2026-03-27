@@ -1,8 +1,11 @@
 # magento2-minResolver
 
+
 A drop-in patch for Magento 2 that fixes intermittent 404 errors caused by
 RequireJS loading plain `.js` files instead of `.min.js` when JavaScript
 minification is enabled in the Admin panel.
+
+Tested on Magento **2.4.7-p9**.
 
 ---
 
@@ -10,42 +13,49 @@ minification is enabled in the Admin panel.
 
 ### What you see
 
-With **Minify JavaScript Files** enabled (Admin → Stores → Config → Advanced →
-Developer → JavaScript Settings), Magento Admin works fine most of the time.
-But after navigating back and forth several times — for example between
-Sales → Orders and Create Order — the browser console suddenly shows:
+With **Minify JavaScript Files** enabled
+(Admin → Stores → Config → Advanced → Developer → JavaScript Settings),
+Magento Admin works fine most of the time. But after navigating back and forth
+several times — for example between Sales → Orders and Create Order — the
+browser console suddenly shows:
 
 ```
 GET /static/version.../adminhtml/.../mage/adminhtml/globals.js
     net::ERR_ABORTED 404 (Not Found)
 ```
 
-The page may partially break: grids don't load, buttons stop working, or
+The page may partially break: grids don’t load, buttons stop responding, or
 JavaScript errors cascade. A hard reload fixes it temporarily — until it
 happens again.
 
-### Why only after several navigations?
+### Why is it intermittent?
 
-This is not a timing race. It is a **lazy context creation** problem.
+The bug does not appear on the first page load. It surfaces only after
+several AJAX navigations within the same browser session. A single smoke
+test is unlikely to catch it.
 
-RequireJS internally manages one or more *contexts* — isolated module
-registries, each with its own URL resolver. Magento ships a small script
-called `requirejs-min-resolver.min.js` that is injected into every Admin page.
-Its job is to force RequireJS to always request `.min.js` URLs.
+---
 
-The original implementation looks like this:
+## Root Causes
+
+Magento ships a small script called `requirejs-min-resolver.min.js` that is
+injected into every Admin page. Its job is to force RequireJS to always
+request `.min.js` URLs. The original implementation contains two defects.
+
+### Defect 1 — Stale `baseUrl` closure
 
 ```javascript
+// Original Magento code
 (function() {
-    var ctx = require.s.contexts._,   // only the default context
+    var ctx = require.s.contexts._,
         origNameToUrl = ctx.nameToUrl,
-        baseUrl = ctx.config.baseUrl;
+        baseUrl = ctx.config.baseUrl;  // captured ONCE at script-load time
 
     ctx.nameToUrl = function() {
         var url = origNameToUrl.apply(ctx, arguments);
-        if (url.indexOf(baseUrl) === 0
-                && !url.match(/\/hugerte\//)
-                && !url.match(/\/v1\/songbird/)) {
+        if (url.indexOf(baseUrl) === 0   // compared against the stale value
+            && !url.match(/\/hugerte\//)
+            && !url.match(/\/v1\/songbird/)) {
             url = url.replace(/(\.min)?\.js$/, '.min.js');
         }
         return url;
@@ -53,41 +63,44 @@ The original implementation looks like this:
 }());
 ```
 
-This patches exactly **one** context: `_` (the default). That is sufficient for
-simple page loads, which is why the bug does not appear immediately.
+`baseUrl` is captured once when the script first runs. During AJAX navigation
+Magento can reconfigure RequireJS (e.g. a new static version path or locale
+segment). After reconfiguration `ctx.config.baseUrl` has a new value, but the
+closed-over `baseUrl` variable is still the old one. The `indexOf` check fails
+for every URL, the `.min.js` rewrite is skipped, and the browser requests the
+plain `.js` file — which does not exist — resulting in a 404.
 
-The problem surfaces when Magento creates a **new named context** — something
-it does lazily, only when certain UI components initialise. The Sales order form,
-for example, can trigger `require.s.newContext` or `require({context: 'order_'...})`
-during its setup. That new context has never seen the resolver patch. It resolves
-module URLs as plain `.js`, which do not exist on disk when minification is
-enabled — resulting in a 404.
+### Defect 2 — Double-wrapping on re-evaluation
 
-Because this depends on the exact sequence of pages visited, the threshold of
-"x navigations" is not fixed. Some sessions stay clean for minutes; others
-hit the bug on the third click.
+On AJAX navigation the Admin can re-inject and re-evaluate
+`requirejs-min-resolver.min.js`. Each evaluation runs
+`ctx.nameToUrl = function() { ... origNameToUrl ... }` where `origNameToUrl`
+was captured from the *current* `ctx.nameToUrl` — which is already the
+patched version from the previous evaluation. The result is a growing chain:
+
+```
+patch3( patch2( patch1( original ) ) )
+```
+
+With no idempotency guard, each additional wrapper can alter the URL
+differently, potentially producing wrong paths or double-suffixed filenames
+like `globals.min.min.js`.
 
 ---
 
-## What This Module Does Differently
+## The Fix
 
-The original script has two gaps:
-
-| Gap | Effect |
-|-----|--------|
-| Only patches the `_` context | Any named context is completely unaffected |
-| No hook for future contexts | Contexts created after script-load time are never patched |
-
-This module replaces the resolver with a single, self-contained IIFE that
-closes both gaps through three layers:
+A single self-contained IIFE that closes both gaps:
 
 ```javascript
 (function(){
+
   function patchCtx(c){
-    if(!c||c.__mRF)return;   // idempotency guard
+    if(!c||c.__mRF)return;   // idempotency guard — never patch twice
     c.__mRF=true;
     var p=c.nameToUrl;
     c.nameToUrl=function(){
+      // baseUrl read dynamically on every call — never goes stale
       var u=p.apply(c,arguments),b=c.config&&c.config.baseUrl;
       if(b&&u.indexOf(b)===0
         &&!/\.min\.js$/.test(u)
@@ -135,37 +148,37 @@ closes both gaps through three layers:
 }());
 ```
 
-### Layer overview
+### How each defect is addressed
 
-| Layer | How | What it catches |
-|-------|-----|-----------------|
-| Context loop | Iterates `require.s.contexts` at load time | All contexts already created, including `_` |
-| `newContext` hook | Wraps `require.s.newContext` | Every context created after the script runs |
-| `require.load` hook | Wraps the XHR dispatcher | Any URL that slipped through — last-resort safety net |
+| Defect | Original | Fix |
+|--------|----------|-----|
+| Stale `baseUrl` | Captured once in outer closure | Read as `c.config.baseUrl` inside the function on every call |
+| Double-wrapping | No guard | `__mRF` flag on each context prevents patching more than once |
 
-### Idempotency
+### Additional layers
 
-Each layer is guarded by a flag (`__mRF`, `__mNCF`, `__mRL`) so that running
-the script multiple times — or loading it from several contexts — never causes
-double-patching.
+| Layer | What it covers |
+|-------|----------------|
+| Context loop at load time | All RequireJS contexts already present, including `_` |
+| `newContext` hook | Every new named context created after the script runs |
+| `require.load` hook | Last-resort safety net — rewrites the URL just before the XHR fires |
+| `__mNCF` / `__mRL` flags | Ensure the `newContext` and `load` hooks are installed exactly once |
 
 ### Exclusions
 
-`hugerte` and `v1/songbird` are third-party libraries that ship **only** as
-unminified JS. Their URLs are explicitly excluded from rewriting.
+`hugerte` and `v1/songbird` are third-party libraries that ship only as
+unminified JS and must not be rewritten.
 
 ---
 
 ## Compatibility
 
-- Magento 2.4.x (tested on 2.4.6 and 2.4.7)
+- Magento 2.4.x (tested on 2.4.7-p9)
 - Theme-independent — works with any Admin theme
 - No PHP, no `setup:di:compile`, no Composer dependency
-- Only relevant when **Minify JavaScript Files** is enabled in Admin;
-  has no effect when minification is off
+- Only active when **Minify JavaScript Files** is enabled; has no effect otherwise
 
 ---
-
 ## Confirmed Magento Core Issues
 
 | Issue | Description |
