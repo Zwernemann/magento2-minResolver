@@ -64,8 +64,7 @@ request `.min.js` URLs. The original implementation contains two defects.
 ```
 
 `baseUrl` is captured once when the script first runs. During AJAX navigation
-Magento can reconfigure RequireJS (e.g. a new static version path or locale
-segment). After reconfiguration `ctx.config.baseUrl` has a new value, but the
+Magento can reconfigure RequireJS. After reconfiguration `ctx.config.baseUrl` has a new value, but the
 closed-over `baseUrl` variable is still the old one. The `indexOf` check fails
 for every URL, the `.min.js` rewrite is skipped, and the browser requests the
 plain `.js` file — which does not exist — resulting in a 404.
