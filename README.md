@@ -1,62 +1,51 @@
-# MinResolver
+# magento2-minResolver
 
-Fixes intermittent `*.min.js` 404 errors in Magento 2 caused by two defects in the generated `requirejs-min-resolver.js`.
+A drop-in patch for Magento 2 that fixes intermittent 404 errors caused by
+RequireJS loading plain `.js` files instead of `.min.js` when JavaScript
+minification is enabled in the Admin panel.
+
+---
 
 ## The Problem
 
-### When does this apply?
+### What you see
 
-The bug appears when **Minify JavaScript Files** is enabled in Admin
-(Stores → Config → Advanced → Developer → JavaScript Settings).
-This setting is independent of `MAGE_MODE` — it works in developer, default,
-and production mode alike.
-
-When minification is active, Magento generates `requirejs-min-resolver.min.js`
-and injects it into every Admin page to ensure RequireJS loads `.min.js` URLs.
-If that resolver has a gap (see Root Cause below), a module gets requested as
-plain `.js`, which returns a 404.
+With **Minify JavaScript Files** enabled (Admin → Stores → Config → Advanced →
+Developer → JavaScript Settings), Magento Admin works fine most of the time.
+But after navigating back and forth several times — for example between
+Sales → Orders and Create Order — the browser console suddenly shows:
 
 ```
-GET /static/.../mage/adminhtml/globals.js net::ERR_ABORTED 404 (Not Found)
+GET /static/version.../adminhtml/.../mage/adminhtml/globals.js
+    net::ERR_ABORTED 404 (Not Found)
 ```
 
-The error does not appear on the first page load. It surfaces only after
-navigating back and forth between Sales → Orders → Create Order several times.
+The page may partially break: grids don't load, buttons stop working, or
+JavaScript errors cascade. A hard reload fixes it temporarily — until it
+happens again.
 
-### Why intermittent? Lazy context creation, not a race condition
+### Why only after several navigations?
 
-This is not a timing/async race. It is a **lazy context creation + accumulated
-state** problem:
+This is not a timing race. It is a **lazy context creation** problem.
 
-1. On first page load the `_` (default) RequireJS context is patched — modules
-   load correctly as `.min.js`.
-2. Subsequent navigations reuse the patched `_` context — no errors.
-3. After enough navigations, Magento triggers a code path that creates a **new
-   named RequireJS context** (e.g. the Sales order form uses
-   `require({context: 'order_...'})` or calls `require.s.newContext` internally).
-4. That new context was never patched — it resolves URLs as plain `.js`.
-5. 404.
+RequireJS internally manages one or more *contexts* — isolated module
+registries, each with its own URL resolver. Magento ships a small script
+called `requirejs-min-resolver.min.js` that is injected into every Admin page.
+Its job is to force RequireJS to always request `.min.js` URLs.
 
-The "x navigations" threshold is not fixed. It depends on which combination of
-pages was visited and which code paths were exercised. The same session can go
-clean for a long time and then suddenly break when a particular state is reached.
-
-### Root Cause in the Original Script
-
-Magento ships `requirejs-min-resolver.min.js` to force `.min.js` resolution.
-The original version:
+The original implementation looks like this:
 
 ```javascript
 (function() {
-    var ctx = require.s.contexts._,
+    var ctx = require.s.contexts._,   // only the default context
         origNameToUrl = ctx.nameToUrl,
         baseUrl = ctx.config.baseUrl;
 
     ctx.nameToUrl = function() {
         var url = origNameToUrl.apply(ctx, arguments);
         if (url.indexOf(baseUrl) === 0
-            && !url.match(/\/hugerte\//)
-            && !url.match(/\/v1\/songbird/)) {
+                && !url.match(/\/hugerte\//)
+                && !url.match(/\/v1\/songbird/)) {
             url = url.replace(/(\.min)?\.js$/, '.min.js');
         }
         return url;
@@ -64,36 +53,38 @@ The original version:
 }());
 ```
 
-This has two critical weaknesses:
+This patches exactly **one** context: `_` (the default). That is sufficient for
+simple page loads, which is why the bug does not appear immediately.
 
-**1. Only patches the `_` context**
-Any named context created via `require({context: ...})` or `require.s.newContext`
-is completely unaffected.
+The problem surfaces when Magento creates a **new named context** — something
+it does lazily, only when certain UI components initialise. The Sales order form,
+for example, can trigger `require.s.newContext` or `require({context: 'order_'...})`
+during its setup. That new context has never seen the resolver patch. It resolves
+module URLs as plain `.js`, which do not exist on disk when minification is
+enabled — resulting in a 404.
 
-**2. No guard against future contexts**
-Contexts created after the script runs are never patched.
+Because this depends on the exact sequence of pages visited, the threshold of
+"x navigations" is not fixed. Some sessions stay clean for minutes; others
+hit the bug on the third click.
 
-### What a Previous Fix Attempt Introduced
+---
 
-An intermediate version (v4/v5) added a second IIFE below the original block to
-patch all contexts and intercept `newContext`. However, the original first block
-was kept unchanged. This caused:
+## What This Module Does Differently
 
-- The `_` context to be **patched twice** (once by the first block without an
-  idempotency flag, then again by the second block's loop)
-- A wrapped call chain: `secondPatch(firstPatch(original))` — functionally
-  harmless due to the regex guards, but unnecessary and fragile
+The original script has two gaps:
 
-### Current Solution (v6)
+| Gap | Effect |
+|-----|--------|
+| Only patches the `_` context | Any named context is completely unaffected |
+| No hook for future contexts | Contexts created after script-load time are never patched |
 
-The first block is removed entirely. A single self-contained IIFE handles
-everything:
+This module replaces the resolver with a single, self-contained IIFE that
+closes both gaps through three layers:
 
 ```javascript
 (function(){
-  // Patch one context. __mRF flag prevents double-patching.
   function patchCtx(c){
-    if(!c||c.__mRF)return;
+    if(!c||c.__mRF)return;   // idempotency guard
     c.__mRF=true;
     var p=c.nameToUrl;
     c.nameToUrl=function(){
@@ -108,13 +99,13 @@ everything:
     };
   }
 
-  // 1. Patch all currently existing contexts (including _)
+  // Layer 1 — patch every context that exists right now (including _)
   var ctxs=require.s.contexts;
   for(var n in ctxs){
     if(Object.prototype.hasOwnProperty.call(ctxs,n))patchCtx(ctxs[n]);
   }
 
-  // 2. Patch contexts created in the future
+  // Layer 2 — patch every context created from this point on
   if(!require.s.__mNCF){
     require.s.__mNCF=true;
     var oNC=require.s.newContext;
@@ -125,7 +116,7 @@ everything:
     };
   }
 
-  // 3. Intercept require.load as a last-resort safety net
+  // Layer 3 — rewrite the URL at the last possible moment before the XHR fires
   if(!require.__mRL){
     require.__mRL=true;
     var ol=require.load;
@@ -144,16 +135,34 @@ everything:
 }());
 ```
 
-| Layer | What it does |
-|-------|--------------|
-| `patchCtx` loop | Patches every context that already exists at script-load time, including `_` |
-| `newContext` hook | Ensures every context created after this point is patched immediately |
-| `require.load` hook | Final safety net — rewrites the URL just before the XHR fires, catching any context that was somehow missed |
-| `__mRF` / `__mNCF` / `__mRL` flags | Idempotency guards — each layer is applied at most once even if the script is loaded multiple times |
-| `hugerte` / `v1/songbird` exclusions | Third-party libraries that ship only as unminified JS and must not be rewritten |
+### Layer overview
 
+| Layer | How | What it catches |
+|-------|-----|-----------------|
+| Context loop | Iterates `require.s.contexts` at load time | All contexts already created, including `_` |
+| `newContext` hook | Wraps `require.s.newContext` | Every context created after the script runs |
+| `require.load` hook | Wraps the XHR dispatcher | Any URL that slipped through — last-resort safety net |
 
-Registering globally is safe in all cases: the idempotency guard ensures the patch is applied at most once per context regardless of how many times the script is evaluated.
+### Idempotency
+
+Each layer is guarded by a flag (`__mRF`, `__mNCF`, `__mRL`) so that running
+the script multiple times — or loading it from several contexts — never causes
+double-patching.
+
+### Exclusions
+
+`hugerte` and `v1/songbird` are third-party libraries that ship **only** as
+unminified JS. Their URLs are explicitly excluded from rewriting.
+
+---
+
+## Compatibility
+
+- Magento 2.4.x (tested on 2.4.6 and 2.4.7)
+- Theme-independent — works with any Admin theme
+- No PHP, no `setup:di:compile`, no Composer dependency
+- Only relevant when **Minify JavaScript Files** is enabled in Admin;
+  has no effect when minification is off
 
 ---
 
