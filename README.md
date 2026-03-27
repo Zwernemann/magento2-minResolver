@@ -4,31 +4,76 @@ Fixes intermittent `*.min.js` 404 errors in Magento 2 caused by two defects in t
 
 ## The Problem
 
-### Background: How Magento resolves `.min.js` files
+### When does this apply?
 
-In production mode (`MAGE_MODE=production`) Magento deploys minified JavaScript files alongside their non-minified originals (e.g. `globals.min.js` next to `globals.js`). To ensure RequireJS loads the `.min` variant, Magento generates a small script called `requirejs-min-resolver.js` via `Magento\Framework\RequireJs\Config::getMinResolverCode()`. This script monkey-patches RequireJS's internal `nameToUrl()` function — the function that translates a module identifier like `mage/adminhtml/globals` into a URL — so that it appends `.min` before the `.js` extension for any URL that starts with the deployment `baseUrl`.
+The bug appears when **Minify JavaScript Files** is enabled in Admin
+(Stores → Config → Advanced → Developer → JavaScript Settings).
+This setting is independent of `MAGE_MODE` — it works in developer, default,
+and production mode alike.
 
-The generated script looks like this:
+When minification is active, Magento generates `requirejs-min-resolver.min.js`
+and injects it into every Admin page to ensure RequireJS loads `.min.js` URLs.
+If that resolver has a gap (see Root Cause below), a module gets requested as
+plain `.js`, which returns a 404.
+
+### The Problem
+
+```
+GET /static/.../mage/adminhtml/globals.js net::ERR_ABORTED 404 (Not Found)
+```
+
+The error does not appear on the first page load. It surfaces only after
+navigating back and forth between Sales → Orders → Create Order several times.
+
+### Why intermittent? Lazy context creation, not a race condition
+
+This is not a timing/async race. It is a **lazy context creation + accumulated
+state** problem:
+
+1. On first page load the `_` (default) RequireJS context is patched — modules
+   load correctly as `.min.js`.
+2. Subsequent navigations reuse the patched `_` context — no errors.
+3. After enough navigations, Magento triggers a code path that creates a **new
+   named RequireJS context** (e.g. the Sales order form uses
+   `require({context: 'order_...'})` or calls `require.s.newContext` internally).
+4. That new context was never patched — it resolves URLs as plain `.js`.
+5. 404.
+
+The "x navigations" threshold is not fixed. It depends on which combination of
+pages was visited and which code paths were exercised. The same session can go
+clean for a long time and then suddenly break when a particular state is reached.
+
+### Root Cause in the Original Script
+
+Magento ships `requirejs-min-resolver.min.js` to force `.min.js` resolution.
+The original version:
 
 ```javascript
-(function () {
+(function() {
     var ctx = require.s.contexts._,
         origNameToUrl = ctx.nameToUrl,
-        baseUrl = ctx.config.baseUrl;          // (A) captured once
+        baseUrl = ctx.config.baseUrl;
 
     ctx.nameToUrl = function() {
         var url = origNameToUrl.apply(ctx, arguments);
-        if (url.indexOf(baseUrl) === 0) {      // (B) compared against stale value
-            url = url.replace(/(.\.min)?\.js$/, '.min.js');
+        if (url.indexOf(baseUrl) === 0
+            && !url.match(/\/hugerte\//)
+            && !url.match(/\/v1\/songbird/)) {
+            url = url.replace(/(\.min)?\.js$/, '.min.js');
         }
         return url;
     };
-})();
+}());
 ```
 
-This looks straightforward, but it has two independent defects that both lead to the same symptom: a `.js` file is requested instead of its `.min.js` counterpart, which does not exist in production → HTTP 404.
+This has two critical weaknesses:
 
----
+**1. Only patches the `_` context**
+Any named context created via `require({context: ...})` or `require.s.newContext`
+is completely unaffected.
+
+**2. No guard against future contexts**
+Contexts created after the script runs are never patched.
 
 ### Defect 1: Stale `baseUrl` in Closure
 
